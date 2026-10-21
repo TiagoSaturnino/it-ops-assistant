@@ -1,0 +1,100 @@
+"""schemas.py — contratos de dados, saída estruturada e guardrails."""
+from __future__ import annotations
+
+import re
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, model_validator
+
+Categoria = Literal[
+    "REDE", "WINDOWS_SO", "IMPRESSAO_SPOOLER", "IDENTIDADE_PERMISSOES", "ANDROID_KIOSK_MDM",
+    "EMBARCADO_IOT", "APLICACAO", "HARDWARE_FISICO", "OUTROS",
+]
+Ecossistema = Literal["windows", "android", "embarcado", "rede", "indefinido"]
+Contexto = Literal["matriz_ti", "varejo_loja", "logistica_cd", "laboratorio_embarcado", "indefinido"]
+Plataforma = Literal["windows_powershell", "android_adb", "android_mdm", "embarcado", "rede"]
+
+_PADROES_PROIBIDOS = [
+    r"rm\s+-rf", r"\bmkfs\b", r"\bdd\s+if=", r"Format-Volume", r"\bformat\s+[a-z]:",
+    r"Clear-EventLog", r"Remove-Item\s+.*-Recurse", r"Set-MpPreference", r"Disable-NetFirewallProfile",
+    r"netsh\s+advfirewall\s+set\s+.*off", r"Invoke-Expression|\biex\b", r"-EncodedCommand|-enc\b",
+    r"DownloadString|Invoke-WebRequest", r"net\s+user\s+.*\s/add", r"reg\s+delete", r"Stop-Computer",
+    r"pm\s+(uninstall|clear)", r"\bwipe\b|factory[-_ ]?reset|MASTER_CLEAR",
+    r"erase_flash|flash_erase|esptool\S*\s+.*erase",
+]
+DENYLIST = re.compile("|".join(_PADROES_PROIBIDOS), re.IGNORECASE)
+_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+
+
+class _Base(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class Chamado(BaseModel):
+    """Entrada normalizada, independente de Jira ou Zendesk."""
+    ticket_id: str
+    origem: Literal["jira", "zendesk", "manual"]
+    solicitante: str
+    titulo: str
+    descricao: str
+    local: str | None = None
+    ativo: str | None = None  # hostname, serial MDM ou device_id IoT
+    contexto_negocio: Contexto = "indefinido"
+    prioridade_original: str | None = None
+
+
+class Hipotese(_Base):
+    descricao: str
+    probabilidade: Literal["alta", "media", "baixa"]
+    evidencia: str
+
+
+class Comando(_Base):
+    ordem: int
+    descricao: str
+    comando: str
+    plataforma: Plataforma
+    tipo: Literal["somente_leitura", "altera_estado"]
+    requer_aprovacao: bool
+    rollback: str | None
+    resultado_esperado: str
+
+    @model_validator(mode="after")
+    def guardrails(self) -> "Comando":
+        if DENYLIST.search(self.comando):
+            raise ValueError(f"Comando bloqueado pelo guardrail de segurança: {self.comando!r}")
+        if self.tipo == "altera_estado":
+            if not (self.rollback and self.rollback.strip()):
+                raise ValueError("Comando que altera estado exige 'rollback' (ou 'N/A - idempotente').")
+            self.requer_aprovacao = True  # aprovação humana imposta em código, não só no prompt
+        return self
+
+
+class TriagemChamado(_Base):
+    ticket_id: str
+    resumo_tecnico: str
+    ecossistema: Ecossistema
+    contexto_negocio: Contexto
+    categoria_principal: Categoria
+    categorias_secundarias: list[Categoria]
+    prioridade: Literal["P1", "P2", "P3", "P4"]
+    justificativa_prioridade: str
+    impacto: str
+    hipoteses: list[Hipotese]
+    evidencias_coletadas: list[str]
+    plano_diagnostico: list[Comando]
+    informacoes_faltantes: list[str]
+    escalonar_para_n3: bool
+    motivo_escalonamento: str | None
+    resposta_ao_usuario: str
+    tags: list[str]
+
+    @model_validator(mode="after")
+    def politicas(self) -> "TriagemChamado":
+        if self.escalonar_para_n3 and not self.motivo_escalonamento:
+            raise ValueError("escalonar_para_n3=true exige motivo_escalonamento.")
+        if self.prioridade == "P1" and not self.escalonar_para_n3:
+            raise ValueError("Prioridade P1 deve sempre escalar para N3.")
+        if _IPV4.search(self.resposta_ao_usuario):
+            raise ValueError("A resposta ao usuário não pode expor endereços IP internos.")
+        return self

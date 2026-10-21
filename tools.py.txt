@@ -1,0 +1,137 @@
+"""tools.py — ferramentas somente leitura (Tier 0) + ferramenta de saída."""
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Callable
+
+from schemas import TriagemChamado
+
+MODO_SIMULACAO = os.getenv("ITOPS_SIMULACAO", "1") == "1"  # em produção: conectores reais
+
+# Allowlist: cada verificação mapeia para um script FIXO. O modelo escolhe a chave, nunca o código.
+VERIFICACOES_WINDOWS = {
+    "rede": "Get-NetIPConfiguration | Select-Object InterfaceAlias,IPv4Address,IPv4DefaultGateway,DNSServer | ConvertTo-Json -Depth 4",
+    "spooler": "Get-Service Spooler | Select-Object Status,StartType | ConvertTo-Json",
+    "fila_impressao": "Get-Printer | Select-Object Name,PortName,PrinterStatus,DriverName | ConvertTo-Json",
+    "alcance_impressora": (
+        "Get-Printer | ForEach-Object { $ip=(Get-PrinterPort -Name $_.PortName -EA SilentlyContinue).PrinterHostAddress; "
+        "if ($ip) { [pscustomobject]@{Fila=$_.Name; IP=$ip; Ping=(Test-Connection $ip -Count 2 -Quiet); "
+        "Porta9100=(Test-NetConnection $ip -Port 9100 -WarningAction SilentlyContinue).TcpTestSucceeded} } } | ConvertTo-Json"
+    ),
+    "permissoes_impressora": "Get-Printer -Full | Select-Object Name,PermissionSDDL | ConvertTo-Json; whoami /groups",
+    "eventos_impressao": "Get-WinEvent -LogName 'Microsoft-Windows-PrintService/Operational' -MaxEvents 20 | Select-Object TimeCreated,Id,Message | ConvertTo-Json",
+}
+VERIFICACOES_MDM = ["ultimo_checkin", "conectividade_wifi", "app_em_foreground", "bateria_armazenamento", "politica_kiosk"]
+
+FIXTURES: dict[str, Any] = {  # dados SIMULADOS para a demonstração
+    "ativos": {
+        "BRAILLE-PC01": {"tipo": "windows11", "local": "Sala Braille", "winrm": "habilitado",
+                         "impressora": "Braille-Everest (IP configurado 10.20.5.77)"},
+        "TAB-LOJA-07": {"tipo": "android_samsung_kiosk", "local": "Loja Piloto - balcão", "mdm": "Knox/MDM",
+                        "app_operacao": "com.exemplo.atendimento"},
+        "IOT-CAM2-03": {"tipo": "embarcado", "local": "CD - câmara 2",
+                        "contrato": {"protocolo": "MQTT", "topico": "cd/cam2/03/status", "heartbeat_s": 60,
+                                     "firmware": "1.3.2", "vcc_min_v": 4.75}},
+    },
+    "windows": {
+        ("BRAILLE-PC01", "rede"): {"ip": "10.20.5.34", "gateway": "ok", "dns": "ok"},
+        ("BRAILLE-PC01", "fila_impressao"): {"fila": "Braille-Everest", "status": "Offline", "spooler": "Running"},
+        ("BRAILLE-PC01", "alcance_impressora"): {"fila": "Braille-Everest", "ip": "10.20.5.77", "ping": False, "porta_9100": False},
+        ("BRAILLE-PC01", "permissoes_impressora"): {"usuario": "CORP\\sala.braille", "gerenciar_fila": False},
+    },
+    "mdm": {
+        ("TAB-LOJA-07", "conectividade_wifi"): {"ssid": "LOJA-WIFI", "rssi_dbm": -78, "internet_validada": True},
+        ("TAB-LOJA-07", "app_em_foreground"): {"app": "atendimento", "versao": "2.4.1", "reinicios_ultima_hora": 9},
+        ("TAB-LOJA-07", "bateria_armazenamento"): {"bateria_pct": 64, "armazenamento_usado_pct": 96},
+    },
+    "embarcado": {
+        "IOT-CAM2-03": {"ultimo_heartbeat_min": 27, "reset_reason": "brownout", "resets_2h": 14, "rssi_dbm": -61,
+                        "vcc_v": 4.58, "firmware": "1.3.2", "dispositivos_broker_ativos": "11/12"},
+    },
+    "similares": [{"id": "CHM-2026-03310", "resumo": "Impressora de rede offline após queda de energia",
+                   "resolucao": "IP mudou por DHCP; porta atualizada e reserva DHCP criada"}],
+}
+
+
+def _winrm(hostname: str, script: str) -> str:
+    import winrm  # pip install "pywinrm[kerberos]"
+    sessao = winrm.Session(hostname, auth=(os.environ["WINRM_USER"], os.environ["WINRM_PASS"]), transport="kerberos")
+    r = sessao.run_ps(script)
+    return (r.std_out or r.std_err).decode("utf-8", "replace")
+
+
+def consultar_ativo(identificador: str) -> Any:
+    return FIXTURES["ativos"].get(identificador, {"erro": "ativo não encontrado no CMDB"})  # prod: JSM Assets / CMDB
+
+
+def diagnostico_windows(hostname: str, verificacao: str) -> Any:
+    script = VERIFICACOES_WINDOWS[verificacao]  # KeyError = fora da allowlist
+    if MODO_SIMULACAO:
+        return FIXTURES["windows"].get((hostname, verificacao), {"erro": "sem dados na simulação"})
+    return _winrm(hostname, script)
+
+
+def status_tablet_mdm(device_id: str, verificacao: str) -> Any:
+    if verificacao not in VERIFICACOES_MDM:
+        raise ValueError("verificação fora da allowlist")
+    if MODO_SIMULACAO:
+        return FIXTURES["mdm"].get((device_id, verificacao), {"erro": "sem dados na simulação"})
+    raise NotImplementedError("Implemente o conector do seu MDM/Knox (API somente leitura)")
+
+
+def telemetria_embarcado(device_id: str, janela_min: int = 60) -> Any:
+    if MODO_SIMULACAO:
+        return FIXTURES["embarcado"].get(device_id, {"erro": "sem telemetria"})
+    raise NotImplementedError("Implemente a consulta ao broker/telemetria (MQTT, banco de séries temporais)")
+
+
+def buscar_chamados_similares(consulta: str) -> Any:
+    return FIXTURES["similares"]  # prod: busca no Jira/Zendesk ou RAG sobre a base de conhecimento
+
+
+EXECUTORES: dict[str, Callable[..., Any]] = {
+    "consultar_ativo": consultar_ativo, "diagnostico_windows": diagnostico_windows,
+    "status_tablet_mdm": status_tablet_mdm, "telemetria_embarcado": telemetria_embarcado,
+    "buscar_chamados_similares": buscar_chamados_similares,
+}
+
+
+def _tool(nome: str, descricao: str, props: dict, obrigatorios: list[str]) -> dict:
+    return {"name": nome, "description": descricao,
+            "input_schema": {"type": "object", "properties": props, "required": obrigatorios,
+                             "additionalProperties": False}}
+
+
+TOOLS_DIAGNOSTICO = [
+    _tool("consultar_ativo", "Consulta o CMDB: tipo, local, MDM e contrato do dispositivo (embarcados). Somente leitura.",
+          {"identificador": {"type": "string", "description": "Hostname, serial do tablet ou device_id IoT"}},
+          ["identificador"]),
+    _tool("diagnostico_windows", "Verificação PADRONIZADA em estação Windows 11 via WinRM. Somente leitura, sem comandos livres.",
+          {"hostname": {"type": "string"}, "verificacao": {"type": "string", "enum": list(VERIFICACOES_WINDOWS)}},
+          ["hostname", "verificacao"]),
+    _tool("status_tablet_mdm", "Consulta o MDM/Knox sobre um tablet Samsung em modo kiosk. Somente leitura.",
+          {"device_id": {"type": "string"}, "verificacao": {"type": "string", "enum": VERIFICACOES_MDM}},
+          ["device_id", "verificacao"]),
+    _tool("telemetria_embarcado", "Telemetria recente de um dispositivo embarcado: heartbeat, reset, tensão, RSSI, firmware.",
+          {"device_id": {"type": "string"}, "janela_min": {"type": "integer", "minimum": 5, "maximum": 240}},
+          ["device_id"]),
+    _tool("buscar_chamados_similares", "Busca chamados resolvidos parecidos, com a resolução aplicada.",
+          {"consulta": {"type": "string"}}, ["consulta"]),
+]
+
+TOOL_SAIDA = {  # saída estruturada: o input_schema é o próprio schema Pydantic
+    "name": "registrar_triagem",
+    "description": "Finaliza a triagem. Chame UMA vez, ao terminar, com a triagem completa.",
+    "input_schema": TriagemChamado.model_json_schema(),
+}
+
+
+def executar_ferramenta(nome: str, args: dict) -> str:
+    fn = EXECUTORES.get(nome)
+    if fn is None:
+        return json.dumps({"erro": f"ferramenta desconhecida: {nome}"})
+    try:
+        return json.dumps(fn(**args), ensure_ascii=False, default=str)[:4000]  # limita o tamanho
+    except Exception as exc:  # o erro volta ao modelo como dado
+        return json.dumps({"erro": str(exc)})

@@ -1,0 +1,19 @@
+# provider_openai.py
+import os
+
+from openai import OpenAI
+
+from agent import SYSTEM_PROMPT, montar_mensagem
+from schemas import Chamado, TriagemChamado
+
+
+def triar_com_openai(ch: Chamado) -> TriagemChamado:
+    resp = OpenAI().responses.parse(
+        model=os.getenv("ITOPS_OPENAI_MODEL", "gpt-4o-mini"),
+        input=[{"role": "system", "content": SYSTEM_PROMPT},
+               {"role": "user", "content": montar_mensagem(ch)}],
+        text_format=TriagemChamado,
+    )
+    if resp.output_parsed is None:
+        raise RuntimeError("OpenAI não retornou saída estruturada.")
+    return resp.output_parsed

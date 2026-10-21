@@ -1,0 +1,6 @@
+anthropic
+pydantic>=2
+fastapi
+uvicorn
+httpx
+openai

@@ -1,0 +1,102 @@
+"""ticketing.py — adaptadores Jira Service Management e Zendesk (webhook de entrada, nota interna de saída)."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import os
+import re
+
+import httpx
+
+from schemas import Chamado, TriagemChamado
+
+PRIORIDADE_JIRA = {"P1": "Highest", "P2": "High", "P3": "Medium", "P4": "Low"}
+PRIORIDADE_ZENDESK = {"P1": "urgent", "P2": "high", "P3": "normal", "P4": "low"}
+APLICAR_PRIORIDADE = os.getenv("ITOPS_APLICAR_PRIORIDADE") == "1"  # padrão: só sugerir (autonomia gradual)
+
+
+def _adf_para_texto(no) -> str:  # descrição pode vir em Atlassian Document Format
+    if isinstance(no, dict):
+        return (no.get("text") or "") + " ".join(_adf_para_texto(c) for c in no.get("content", []))
+    return str(no or "")
+
+
+def _txt(valor) -> str | None:
+    if valor is None:
+        return None
+    return valor.get("value") if isinstance(valor, dict) and "value" in valor else str(valor)
+
+
+def chamado_from_jira(p: dict) -> Chamado:
+    f = p["issue"]["fields"]
+    cf_local, cf_ativo = os.getenv("JIRA_CF_LOCAL"), os.getenv("JIRA_CF_ATIVO")  # ex.: customfield_10201
+    return Chamado(
+        ticket_id=p["issue"]["key"], origem="jira",
+        solicitante=(f.get("reporter") or {}).get("displayName", "desconhecido"),
+        titulo=f.get("summary") or "",
+        descricao=_adf_para_texto(f.get("description")),
+        local=_txt(f.get(cf_local)) if cf_local else None,
+        ativo=_txt(f.get(cf_ativo)) if cf_ativo else None,
+        prioridade_original=(f.get("priority") or {}).get("name"),
+    )
+
+
+def chamado_from_zendesk(p: dict) -> Chamado:  # formato definido pelo corpo JSON da trigger (seção 2.3)
+    return Chamado(ticket_id=str(p["ticket_id"]), origem="zendesk",
+                   solicitante=p.get("solicitante", "desconhecido"), titulo=p.get("titulo", ""),
+                   descricao=p.get("descricao", ""), local=p.get("local") or None,
+                   ativo=p.get("ativo") or None, prioridade_original=p.get("prioridade"))
+
+
+def validar_jira(token: str) -> bool:  # header X-Itops-Token configurado na regra do Jira Automation
+    return hmac.compare_digest(token, os.environ["JIRA_WEBHOOK_TOKEN"])
+
+
+def validar_zendesk(corpo: bytes, assinatura: str, timestamp: str) -> bool:  # HMAC SHA-256 de timestamp + corpo
+    segredo = os.environ["ZENDESK_WEBHOOK_SECRET"].encode()
+    esperado = base64.b64encode(hmac.new(segredo, timestamp.encode() + corpo, hashlib.sha256).digest()).decode()
+    return hmac.compare_digest(esperado, assinatura)
+
+
+def _label(tag: str) -> str:
+    return re.sub(r"\W+", "_", tag.strip().lower())
+
+
+def renderizar_nota(t: TriagemChamado, trilha: list[dict]) -> str:
+    L = ["🤖 TRIAGEM ASSISTIDA (rascunho para revisão humana)",
+         f"Categoria: {t.categoria_principal} | Prioridade sugerida: {t.prioridade} | Ecossistema: {t.ecossistema}",
+         f"Resumo: {t.resumo_tecnico}", f"Justificativa: {t.justificativa_prioridade}", "", "Evidências coletadas:"]
+    L += [f"- {e}" for e in t.evidencias_coletadas]
+    L += ["", "Plano de diagnóstico:"]
+    for c in sorted(t.plano_diagnostico, key=lambda x: x.ordem):
+        sel = "[APROVAÇÃO NECESSÁRIA] " if c.requer_aprovacao else ""
+        L.append(f"{c.ordem}. {sel}{c.descricao}\n   {c.comando}")
+        if c.rollback:
+            L.append(f"   rollback: {c.rollback}")
+    if t.escalonar_para_n3:
+        L += ["", f"ESCALONAR N3: {t.motivo_escalonamento}"]
+    L += ["", "Minuta de resposta ao usuário (não enviada):", t.resposta_ao_usuario, "",
+          "Ferramentas usadas: " + (", ".join(x["ferramenta"] for x in trilha) or "nenhuma")]
+    return "\n".join(L)
+
+
+def publicar_jira(t: TriagemChamado, nota: str) -> None:
+    auth = (os.environ["JIRA_EMAIL"], os.environ["JIRA_API_TOKEN"])
+    campos: dict = {"update": {"labels": [{"add": _label(x)} for x in ["ia_triagem", *t.tags]]}}
+    if APLICAR_PRIORIDADE:
+        campos["fields"] = {"priority": {"name": PRIORIDADE_JIRA[t.prioridade]}}
+    with httpx.Client(base_url=os.environ["JIRA_BASE_URL"], auth=auth, timeout=20) as c:
+        c.post(f"/rest/servicedeskapi/request/{t.ticket_id}/comment",
+               json={"body": nota, "public": False}).raise_for_status()  # nota INTERNA
+        c.put(f"/rest/api/3/issue/{t.ticket_id}", json=campos).raise_for_status()
+
+
+def publicar_zendesk(t: TriagemChamado, nota: str) -> None:
+    auth = (f"{os.environ['ZENDESK_EMAIL']}/token", os.environ["ZENDESK_API_TOKEN"])
+    ticket: dict = {"comment": {"body": nota, "public": False},  # nota INTERNA
+                    "additional_tags": [_label(x) for x in ["ia_triagem", *t.tags]]}
+    if APLICAR_PRIORIDADE:
+        ticket["priority"] = PRIORIDADE_ZENDESK[t.prioridade]
+    url = f"https://{os.environ['ZENDESK_SUBDOMAIN']}.zendesk.com/api/v2/tickets/{t.ticket_id}.json"
+    httpx.put(url, auth=auth, json={"ticket": ticket}, timeout=20).raise_for_status()
